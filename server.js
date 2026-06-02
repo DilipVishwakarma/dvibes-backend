@@ -19,6 +19,8 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+const STORAGE_BASE_URL = (process.env.STORAGE_BASE_URL || 'https://dilipaudistream.page.gd/App').replace(/\/$/, '');
+
 function mapSongRowToCard(row) {
   const thumb = row.thumbnail_path || row.cover_image || '';
   const thumbnailUrl = toPublicAudioOrImageUrl(thumb) || 'assets/images/default-album.jpg';
@@ -39,16 +41,20 @@ function toPublicAudioOrImageUrl(path) {
   if (!path) return '';
   const normalized = path.replace(/\\/g, '/').replace(/^\//, '');
 
+  if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
+    return normalized;
+  }
+
+  let relativePath = normalized;
   if (normalized.startsWith('music/')) {
-    return 'storage/music/' + normalized.substring('music/'.length);
+    relativePath = 'storage/music/' + normalized.substring('music/'.length);
+  } else if (normalized.startsWith('storage/music/')) {
+    relativePath = 'storage/music/' + normalized.substring('storage/music/'.length);
+  } else if (normalized.startsWith('storage/thumbnails/')) {
+    relativePath = 'storage/thumbnails/' + normalized.substring('storage/thumbnails/'.length);
   }
-  if (normalized.startsWith('storage/music/')) {
-    return 'storage/music/' + normalized.substring('storage/music/'.length);
-  }
-  if (normalized.startsWith('storage/thumbnails/')) {
-    return 'storage/thumbnails/' + normalized.substring('storage/thumbnails/'.length);
-  }
-  return normalized;
+
+  return `${STORAGE_BASE_URL}/${relativePath}`;
 }
 
 async function querySongs(conn, sql, params = []) {
