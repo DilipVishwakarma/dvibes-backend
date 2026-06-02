@@ -19,6 +19,43 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+function mapSongRowToCard(row) {
+  const thumb = row.thumbnail_path || row.cover_image || '';
+  const thumbnailUrl = toPublicAudioOrImageUrl(thumb) || 'assets/images/default-album.jpg';
+  const audioUrl = toPublicAudioOrImageUrl(row.file_path || '');
+
+  return {
+    id: row.song_id || row.id,
+    title: row.song_title || row.title,
+    artists: row.artist_names || row.artists || row.artists_name || null,
+    duration: row.duration != null ? Number(row.duration) : null,
+    file_path: row.file_path || null,
+    thumbnail_url: thumbnailUrl,
+    audio_url: audioUrl,
+  };
+}
+
+function toPublicAudioOrImageUrl(path) {
+  if (!path) return '';
+  const normalized = path.replace(/\\/g, '/').replace(/^\//, '');
+
+  if (normalized.startsWith('music/')) {
+    return 'storage/music/' + normalized.substring('music/'.length);
+  }
+  if (normalized.startsWith('storage/music/')) {
+    return 'storage/music/' + normalized.substring('storage/music/'.length);
+  }
+  if (normalized.startsWith('storage/thumbnails/')) {
+    return 'storage/thumbnails/' + normalized.substring('storage/thumbnails/'.length);
+  }
+  return normalized;
+}
+
+async function querySongs(conn, sql, params = []) {
+  const [rows] = await conn.query(sql, params);
+  return rows.map(mapSongRowToCard);
+}
+
 // Random Songs
 app.get('/api/random_songs', async (req, res) => {
   try {
@@ -27,24 +64,40 @@ app.get('/api/random_songs', async (req, res) => {
     const seed = req.query.seed || null;
 
     const conn = await pool.getConnection();
-    
-    // Get total count
     const [countResult] = await conn.query('SELECT COUNT(*) as total FROM songs');
     const total = countResult[0].total;
 
-    // Get songs
-    let query = 'SELECT id, title, artists, audio_url, thumbnail_url, duration FROM songs LIMIT ? OFFSET ?';
-    const [songs] = await conn.query(query, [limit, offset]);
-    
+    const baseQuery = `
+      SELECT
+        s.id AS song_id,
+        s.title AS song_title,
+        s.duration,
+        s.file_path,
+        s.thumbnail_path,
+        GROUP_CONCAT(DISTINCT ar.name ORDER BY ar.name SEPARATOR ', ') AS artist_names
+      FROM songs s
+      LEFT JOIN song_artists sa ON sa.song_id = s.id
+      LEFT JOIN artists ar ON ar.id = sa.artist_id
+      GROUP BY s.id
+    `;
+
+    const orderClause = seed
+      ? ' ORDER BY MD5(CONCAT(?, CAST(s.id AS CHAR))), s.id'
+      : ' ORDER BY RAND()';
+
+    const finalQuery = `${baseQuery} ${orderClause} LIMIT ? OFFSET ?`;
+    const params = seed ? [seed, limit, offset] : [limit, offset];
+    const songs = await querySongs(conn, finalQuery, params);
+
     conn.release();
 
     res.json({
-      songs: songs,
-      total: total,
-      limit: limit,
-      offset: offset,
-      seed: seed,
-      hasMore: (offset + limit) < total
+      songs,
+      total,
+      limit,
+      offset,
+      seed,
+      hasMore: (offset + limit) < total,
     });
   } catch (error) {
     console.error('Error:', error);
@@ -70,17 +123,29 @@ app.get('/api/artists', async (req, res) => {
 app.get('/api/search', async (req, res) => {
   try {
     const query = req.query.q || '';
-    
     if (!query) {
       res.json([]);
       return;
     }
 
     const conn = await pool.getConnection();
-    const [songs] = await conn.query(
-      'SELECT id, title, artists, audio_url, thumbnail_url, duration FROM songs WHERE title LIKE ? LIMIT 50',
-      [`%${query}%`]
-    );
+    const sql = `
+      SELECT
+        s.id AS song_id,
+        s.title AS song_title,
+        s.duration,
+        s.file_path,
+        s.thumbnail_path,
+        GROUP_CONCAT(DISTINCT ar.name ORDER BY ar.name SEPARATOR ', ') AS artist_names
+      FROM songs s
+      LEFT JOIN song_artists sa ON sa.song_id = s.id
+      LEFT JOIN artists ar ON ar.id = sa.artist_id
+      WHERE s.title LIKE ?
+      GROUP BY s.id
+      ORDER BY s.id DESC
+      LIMIT 50
+    `;
+    const songs = await querySongs(conn, sql, [`%${query}%`]);
     conn.release();
 
     res.json(songs);
@@ -94,17 +159,28 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/artist_songs', async (req, res) => {
   try {
     const artistId = parseInt(req.query.artistId) || 0;
-
     if (artistId === 0) {
       res.json([]);
       return;
     }
 
     const conn = await pool.getConnection();
-    const [songs] = await conn.query(
-      'SELECT id, title, artists, audio_url, thumbnail_url, duration FROM songs WHERE artists LIKE ? LIMIT 100',
-      [`%${artistId}%`]
-    );
+    const sql = `
+      SELECT
+        s.id AS song_id,
+        s.title AS song_title,
+        s.duration,
+        s.file_path,
+        s.thumbnail_path,
+        GROUP_CONCAT(DISTINCT ar.name ORDER BY ar.name SEPARATOR ', ') AS artist_names
+      FROM songs s
+      INNER JOIN song_artists sa ON sa.song_id = s.id
+      LEFT JOIN artists ar ON ar.id = sa.artist_id
+      WHERE sa.artist_id = ?
+      GROUP BY s.id
+      LIMIT 100
+    `;
+    const songs = await querySongs(conn, sql, [artistId]);
     conn.release();
 
     res.json(songs);
@@ -118,24 +194,31 @@ app.get('/api/artist_songs', async (req, res) => {
 app.get('/api/song', async (req, res) => {
   try {
     const songId = parseInt(req.query.id) || 0;
-
     if (songId === 0) {
       res.json({});
       return;
     }
 
     const conn = await pool.getConnection();
-    const [songs] = await conn.query(
-      'SELECT id, title, artists, audio_url, thumbnail_url, duration FROM songs WHERE id = ? LIMIT 1',
-      [songId]
-    );
+    const sql = `
+      SELECT
+        s.id AS song_id,
+        s.title AS song_title,
+        s.duration,
+        s.file_path,
+        s.thumbnail_path,
+        GROUP_CONCAT(DISTINCT ar.name ORDER BY ar.name SEPARATOR ', ') AS artist_names
+      FROM songs s
+      LEFT JOIN song_artists sa ON sa.song_id = s.id
+      LEFT JOIN artists ar ON ar.id = sa.artist_id
+      WHERE s.id = ?
+      GROUP BY s.id
+      LIMIT 1
+    `;
+    const songs = await querySongs(conn, sql, [songId]);
     conn.release();
 
-    if (songs.length > 0) {
-      res.json(songs[0]);
-    } else {
-      res.json({});
-    }
+    res.json(songs[0] || {});
   } catch (error) {
     console.error('Error:', error);
     res.status(500).json({ error: error.message });
