@@ -3,6 +3,10 @@ const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const puppeteer = require('puppeteer');
+const pptrExtra = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+pptrExtra.use(StealthPlugin());
 
 const app = express();
 
@@ -247,7 +251,100 @@ app.get('/api/stream', async (req, res) => {
       return res.status(upstream.status).send(text);
     }
 
-    const contentType = upstream.headers.get('content-type') || 'audio/mpeg';
+    const contentType = upstream.headers.get('content-type') || '';
+
+    // If the upstream returned an HTML wrapper (JS redirect), use Puppeteer
+    if (contentType.includes('text/html')) {
+      const body = await upstream.text();
+      // quick check for the common JS redirect pattern
+      if (body.includes('location.href') || body.includes('aes.js')) {
+        try {
+          console.log('[stream-proxy] HTML wrapper detected, launching Puppeteer for', sourceUrl);
+          const browser = await pptrExtra.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+            ignoreHTTPSErrors: true,
+          });
+          const page = await browser.newPage();
+          page.setDefaultNavigationTimeout(60000);
+          page.setDefaultTimeout(60000);
+          // set common browser user agent and headers to reduce bot detection
+          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
+          await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9', 'Referer': sourceUrl });
+          await page.setBypassCSP(true);
+
+          // navigate and wait for DOM; the site typically loads aes.js and sets a cookie then redirects
+          const resp = await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          console.log('[stream-proxy] page.goto response status', resp && resp.status());
+
+          // attempt to capture the AES script if it is loaded so we can debug if needed
+          try {
+            const aesResp = await page.waitForResponse(resp => resp.url().endsWith('/aes.js') && resp.status() === 200, { timeout: 10000 });
+            const aesCode = await aesResp.text();
+            console.log('[stream-proxy] aes.js loaded length', aesCode.length);
+          } catch (e) {
+            console.log('[stream-proxy] aes.js not observed');
+          }
+
+          // wait for the cookie that JS sets (site sets __test cookie) or for redirect
+          try {
+            await page.waitForFunction("document.cookie.indexOf('__test=') !== -1 || window.location.href.indexOf('?i=') !== -1", { timeout: 30000 });
+            console.log('[stream-proxy] waitForFunction succeeded');
+          } catch (e) {
+            console.log('[stream-proxy] waitForFunction timed out');
+          }
+
+          const finalUrl = page.url();
+          const cookies = await page.cookies();
+          const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+          console.log('[stream-proxy] finalUrl', finalUrl);
+          console.log('[stream-proxy] cookies', cookieHeader);
+          await browser.close();
+
+          const finalHeaders = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'Accept': 'audio/*,*/*;q=0.9',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': sourceUrl,
+          };
+          if (req.headers.range) finalHeaders.Range = req.headers.range;
+          if (cookieHeader) finalHeaders.Cookie = cookieHeader;
+
+          const finalRes = await fetch(finalUrl, { headers: finalHeaders, redirect: 'follow' });
+          console.log('[stream-proxy] final fetch status', finalRes.status, 'content-type', finalRes.headers.get('content-type'));
+          if (!finalRes.ok) {
+            const txt = await finalRes.text();
+            console.log('[stream-proxy] final fetch body preview', txt.slice(0, 300));
+            return res.status(finalRes.status).send(txt);
+          }
+
+          const finalContentType = finalRes.headers.get('content-type') || 'audio/mpeg';
+          const finalContentLength = finalRes.headers.get('content-length');
+          const finalAcceptRanges = finalRes.headers.get('accept-ranges') || 'bytes';
+
+          if (finalContentLength) res.setHeader('Content-Length', finalContentLength);
+          res.setHeader('Content-Type', finalContentType);
+          res.setHeader('Accept-Ranges', finalAcceptRanges);
+          if (finalRes.status === 206) res.status(206);
+
+          if (finalContentType.includes('text/html')) {
+            const txt = await finalRes.text();
+            console.log('[stream-proxy] final response still HTML', txt.slice(0, 300));
+            return res.status(502).send('Final URL returned HTML instead of audio');
+          }
+
+          finalRes.body.pipe(res);
+          return;
+        } catch (err) {
+          console.error('Puppeteer error resolving media URL', err);
+          // fallthrough to attempt piping the original response
+        }
+      }
+      // If not handled, return the HTML body
+      res.setHeader('Content-Type', 'text/html');
+      return res.send(body);
+    }
+
     const contentLength = upstream.headers.get('content-length');
     const acceptRanges = upstream.headers.get('accept-ranges') || 'bytes';
 
