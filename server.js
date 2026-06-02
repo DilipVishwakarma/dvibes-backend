@@ -54,7 +54,7 @@ function toPublicAudioOrImageUrl(path) {
     relativePath = 'storage/thumbnails/' + normalized.substring('storage/thumbnails/'.length);
   }
 
-  return `${STORAGE_BASE_URL}/${relativePath}`;
+  return encodeURI(`${STORAGE_BASE_URL}/${relativePath}`);
 }
 
 async function querySongs(conn, sql, params = []) {
