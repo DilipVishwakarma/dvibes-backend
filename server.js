@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 
@@ -228,6 +229,37 @@ app.get('/api/song', async (req, res) => {
   } catch (error) {
     console.error('Error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Streaming proxy to serve remote or storage-hosted audio with Range support
+app.get('/api/stream', async (req, res) => {
+  try {
+    const sourceUrl = req.query.url;
+    if (!sourceUrl) return res.status(400).send('Missing url');
+
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    const upstream = await fetch(sourceUrl, { headers });
+    if (!upstream.ok) {
+      const text = await upstream.text();
+      return res.status(upstream.status).send(text);
+    }
+
+    const contentType = upstream.headers.get('content-type') || 'audio/mpeg';
+    const contentLength = upstream.headers.get('content-length');
+    const acceptRanges = upstream.headers.get('accept-ranges') || 'bytes';
+
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', acceptRanges);
+    if (upstream.status === 206) res.status(206);
+
+    upstream.body.pipe(res);
+  } catch (err) {
+    console.error('Stream proxy error', err);
+    res.status(500).send('Stream error');
   }
 });
 
